@@ -205,3 +205,22 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Unity
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild*/
+[Bb]uilds*/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+MemoryCaptures/
+*.unitypackage
+# ML-Agents training output
+results/
+**/ML-Agents/Timers/*
+# OS/IDE
+.DS_Store
+.idea/
+.vscode/*
+*.code-workspace
