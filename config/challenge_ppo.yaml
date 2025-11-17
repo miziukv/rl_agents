@@ -23,6 +23,3 @@ behaviors:
     time_horizon: 128
     summary_freq: 5000
     checkpoint_interval: 200000
-engine:
-  time_scale: 20            # speeds up physics during training
-  capture_frame_rate: 0

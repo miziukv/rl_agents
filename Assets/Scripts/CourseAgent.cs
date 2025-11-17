@@ -56,9 +56,13 @@ public class CourseAgent : Agent
         float turn  = Mathf.Clamp(ca[2], -1f, 1f);
         float jumpGate = ca[3];
 
-        // Move in agent's local frame
-        Vector3 move = (transform.right * moveX + transform.forward * moveZ) * moveSpeed;
-        _rb.AddForce(new Vector3(move.x, 0f, move.z), ForceMode.Acceleration);
+        Vector3 moveDir = (transform.right * moveX + transform.forward * moveZ);
+        if (moveDir.sqrMagnitude > 1e-4f) moveDir.Normalize();
+
+        Vector3 v = _rb.linearVelocity;
+        Vector3 desired = moveDir * moveSpeed;
+        Vector3 delta = desired - new Vector3(v.x, 0f, v.z);
+        _rb.AddForce(delta, ForceMode.VelocityChange);  // drives v→desired each step
 
         // Turn
         transform.Rotate(Vector3.up, turn * turnSpeed * Time.fixedDeltaTime);
