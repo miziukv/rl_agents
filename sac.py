@@ -35,7 +35,7 @@ class SACCfg:
     device: str = "cpu"
     # logging/checkpoints
     save_every: int = 100_000
-    out_dir: str = "./sac_ckpts"
+    out_dir: str = "./sac_ckpts"  # SAC checkpoints go here (PPO uses ./results)
     # Unity connection
     worker_id: int = 0
     base_port: int = 5004
@@ -216,22 +216,28 @@ def connect_unity(worker_id=None, base_port=None):
     if base_port is None:
         base_port = cfg.base_port
     
+    # Unity Editor requires worker_id=0 when file_name=None
+    if worker_id != 0:
+        print(f"[Warning] Unity Editor requires worker_id=0, but got {worker_id}. Using worker_id=0.")
+        worker_id = 0
+    
     engine = EngineConfigurationChannel()
     engine.set_configuration_parameters(time_scale=20, quality_level=0, width=640, height=480)
     
-    # Try to connect, if port is in use, try next worker_id
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            env = UnityEnvironment(file_name=None, side_channels=[engine], worker_id=worker_id, base_port=base_port)
-            break
-        except UnityWorkerInUseException as e:
-            if attempt < max_retries - 1:
-                print(f"Port {base_port + worker_id} in use, trying worker_id={worker_id + 1}...")
-                worker_id += 1
-            else:
-                raise RuntimeError(f"Could not connect to Unity after {max_retries} attempts. "
-                                 f"Please close any existing Unity environments or Python processes using ports {base_port}-{base_port + max_retries}.")
+    # Try to connect to Unity Editor (file_name=None requires worker_id=0)
+    try:
+        env = UnityEnvironment(file_name=None, side_channels=[engine], worker_id=0, base_port=base_port)
+    except UnityWorkerInUseException as e:
+        print(f"\n[ERROR] Port {base_port} is already in use!")
+        print("This usually means:")
+        print("  1. Another Python script is using port 5004")
+        print("  2. A previous Unity environment connection wasn't closed properly")
+        print("\nTo fix this:")
+        print("  - Close any other Python scripts using ML-Agents")
+        print("  - Or kill the process using port 5004:")
+        print(f"    Windows: netstat -ano | findstr :{base_port}")
+        print(f"    Then: taskkill /PID <PID> /F")
+        raise RuntimeError(f"Port {base_port} is in use. Please close other ML-Agents processes or kill the process using port {base_port}.")
     
     env.reset()
     behavior = list(env.behavior_specs.keys())[0]
@@ -243,6 +249,32 @@ def connect_unity(worker_id=None, base_port=None):
     if spec.action_spec.continuous_size == 0:
         raise ValueError(f"Expected continuous action space, but got discrete_size={spec.action_spec.discrete_size}, continuous_size={spec.action_spec.continuous_size}. "
                          f"Please check Unity Behavior Parameters: Behavior Type should be 'Default' and Actions should be Continuous (Size=4).")
+    
+    # Wait for Unity to be ready and have agents
+    # After reset(), we need to get_steps() to see if agents are available
+    # If not, we may need to send dummy actions and step once
+    print("[Unity] Waiting for agents to be ready...")
+    dec, term = env.get_steps(behavior)
+    
+    # If no agents yet, send dummy actions and step once to initialize
+    if len(dec) == 0 and len(term) == 0:
+        # Create dummy actions for initialization
+        dummy_continuous = np.zeros((1, spec.action_spec.continuous_size), dtype=np.float32)
+        if spec.action_spec.discrete_size > 0:
+            dummy_discrete = np.zeros((1, spec.action_spec.discrete_size), dtype=np.int32)
+            dummy_actions = ActionTuple(continuous=dummy_continuous, discrete=dummy_discrete)
+        else:
+            dummy_actions = ActionTuple(continuous=dummy_continuous)
+        
+        env.set_actions(behavior, dummy_actions)
+        env.step()
+        dec, term = env.get_steps(behavior)
+    
+    if len(dec) == 0 and len(term) == 0:
+        raise RuntimeError("Unity environment did not produce any agents. Make sure Unity Editor is in Play mode and the scene has agents.")
+    
+    print(f"[Unity] Connected! Found {len(dec)} decision agents, {len(term)} terminal agents")
+    
     obs_dim = spec.observation_specs[0].shape[0]
     act_dim = spec.action_spec.continuous_size
     discrete_size = spec.action_spec.discrete_size
@@ -268,7 +300,21 @@ def unity_step(env, behavior, actions_np: np.ndarray, spec=None, discrete_action
         actions = ActionTuple(continuous=actions_np)
     
     env.set_actions(behavior, actions)
-    env.step()
+    
+    # Step the environment - Unity must be running and responsive
+    try:
+        env.step()
+    except Exception as e:
+        error_msg = str(e)
+        if "timeout" in error_msg.lower() or "took too long" in error_msg.lower():
+            print("\n[ERROR] Unity Editor is not responding!")
+            print("Make sure:")
+            print("  1. Unity Editor is running and in Play mode")
+            print("  2. The scene has agents with Behavior Type = 'Default'")
+            print("  3. Unity Editor is not frozen or paused")
+            print("  4. ML-Agents versions match between Unity and Python")
+        raise
+    
     dec, term = env.get_steps(behavior)
     return dec, term
 
@@ -277,6 +323,14 @@ def unity_step(env, behavior, actions_np: np.ndarray, spec=None, discrete_action
 # -----------------------------
 def collect_step(env, behavior, spec, agent: SACAgent, replay: Replay, deterministic=False):
     dec, term = env.get_steps(behavior)
+    
+    # Skip if no agents need decisions
+    if len(dec) == 0:
+        # If we have terminal agents, step to get new decision agents
+        if len(term) > 0:
+            env.step()
+        return 0
+    
     obs = dec.obs[0]  # [N, obs_dim]
     obs_t = torch.tensor(obs, dtype=torch.float32, device=agent.device)
     with torch.no_grad():
@@ -328,6 +382,18 @@ def train():
     # Initial random exploration
     while env_steps < cfg.init_random_steps:
         dec, term = env.get_steps(behavior)
+        
+        # Skip if no agents need decisions
+        if len(dec) == 0:
+            # If we have terminal agents, step to get new decision agents
+            if len(term) > 0:
+                # Terminal agents don't need actions, just step
+                env.step()
+            else:
+                # No agents at all, wait a bit
+                time.sleep(0.01)
+            continue
+        
         obs = dec.obs[0]
         a = np.random.uniform(-1.0, 1.0, size=(len(dec), act_dim)).astype(np.float32)
         dec2, term = unity_step(env, behavior, a, spec=spec)
