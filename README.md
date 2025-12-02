@@ -180,6 +180,57 @@ Look for mean reward trending upward and more frequent goal hits.
 
 ---
 
+## 4b) SAC Training (Custom Implementation)
+
+A custom Soft Actor-Critic (SAC) implementation is provided in `train_sac.py` for comparison with PPO.
+
+### Start SAC Training
+
+From repo root:
+
+```bash
+python train_sac.py --run-id=sac_course_v1
+```
+
+### SAC Hyperparameters
+
+Default hyperparameters (can be overridden via command line):
+- `--batch-size`: 256
+- `--buffer-size`: 1000000
+- `--learning-starts`: 10000 (random exploration before learning)
+- `--gamma`: 0.995
+- `--tau`: 0.005 (soft update coefficient)
+- `--alpha`: 0.2 (entropy coefficient, auto-tuned)
+- `--lr`: 3e-4
+- `--hidden-dim`: 256
+
+### Connect Unity
+
+1. In Unity, select the Agent:
+   - **Behavior Parameters → Behavior Type** = `Default`.
+   - **Decision Requester → Decision Period** = `5`.
+   - **Max Step** = `1000` (recommended).
+2. Press **Play**. The trainer should report it connected and start stepping.
+
+### Monitor Training
+
+```bash
+tensorboard --logdir results
+```
+
+Compare SAC vs PPO:
+- SAC typically learns faster (sample efficient) but may be less stable
+- PPO is more stable but requires more samples
+- Check `episode/mean_reward` in TensorBoard for comparison
+
+### Resume Training
+
+```bash
+python train_sac.py --run-id=sac_course_v1 --resume
+```
+
+---
+
 ## 5) Use the Trained Policy in the Editor
 
 1. Find the exported `.onnx` model in `results/<run-id>/` (or export via ML-Agents menu).
