@@ -1,4 +1,5 @@
 import os, time, random, math
+import argparse
 from dataclasses import dataclass
 from typing import Tuple, Deque
 from collections import deque
@@ -11,6 +12,9 @@ import torch.optim as optim
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.side_channel.engine_configuration_channel import EngineConfigurationChannel
 from mlagents_envs.base_env import DecisionSteps, TerminalSteps, ActionTuple
+from mlagents_envs.exception import UnityWorkerInUseException
+
+from torch.utils.tensorboard import SummaryWriter
 
 # -----------------------------
 # Config
@@ -20,9 +24,9 @@ class SACCfg:
     total_env_steps: int = 500_000
     init_random_steps: int = 10_000
     update_after: int = 10_000
-    update_every: int = 50
-    gradient_steps: int = 50      # updates per update_every
-    batch_size: int = 256
+    update_every: int = 10     # Update every 10 steps (gives Unity time to run between updates)
+    gradient_steps: int = 1    # One gradient step per update
+    batch_size: int = 128      # Smaller batch for faster updates
     gamma: float = 0.995
     tau: float = 0.005            # target smoothing
     lr: float = 3e-4
@@ -32,10 +36,11 @@ class SACCfg:
     # replay
     replay_size: int = 1_000_000
     # device
-    device: str = "cpu"
+    device: str = "cuda"
     # logging/checkpoints
     save_every: int = 100_000
-    out_dir: str = "./sac_ckpts"  # SAC checkpoints go here (PPO uses ./results)
+    out_dir: str = "./results/sac_course"  # SAC checkpoints/logs go here (matches PPO structure)
+    summary_freq: int = 20000  # Log metrics every N steps (reduced frequency to reduce overhead)
     # Unity connection
     worker_id: int = 0
     base_port: int = 5004
@@ -130,6 +135,9 @@ class QCritic(nn.Module):
 class SACAgent:
     def __init__(self, obs_dim, act_dim, cfg: SACCfg):
         self.device = torch.device(cfg.device)
+        print(f"[Device] Using device: {self.device}")
+        if self.device.type == 'cuda':
+            print(f"[Device] GPU: {torch.cuda.get_device_name(0)}")
         self.actor = GaussianPolicy(obs_dim, act_dim, cfg.hidden).to(self.device)
         self.critic = QCritic(obs_dim, act_dim, cfg.hidden).to(self.device)
         self.critic_tgt = QCritic(obs_dim, act_dim, cfg.hidden).to(self.device)
@@ -138,18 +146,15 @@ class SACAgent:
         self.opt_actor = optim.Adam(self.actor.parameters(), lr=cfg.lr)
         self.opt_critic = optim.Adam(self.critic.parameters(), lr=cfg.lr)
 
-        # Entropy coef (alpha) with auto-tuning
-        self.log_alpha = torch.tensor(0.0, requires_grad=True, device=self.device)
-        self.opt_alpha = optim.Adam([self.log_alpha], lr=cfg.lr)
-        self.target_entropy = -act_dim * cfg.target_entropy_scale
+        # Entropy coef (alpha) - constant (auto-tuning disabled)
+        self.log_alpha = None
+        self.alpha = torch.tensor(0.2, device=self.device)  # Constant alpha value
+        self.opt_alpha = None
+        self.target_entropy = None
 
         self.gamma = cfg.gamma
         self.tau = cfg.tau
         self.cfg = cfg
-
-    @property
-    def alpha(self):
-        return self.log_alpha.exp()
 
     def act(self, obs_t, deterministic=False):
         with torch.no_grad():
@@ -187,30 +192,30 @@ class SACAgent:
         actor_loss.backward()
         self.opt_actor.step()
 
-        # Alpha (entropy) update
-        alpha_loss = -(self.log_alpha * (logp.detach() + self.target_entropy)).mean()
-        self.opt_alpha.zero_grad()
-        alpha_loss.backward()
-        self.opt_alpha.step()
+        # Alpha (entropy) update - disabled (using constant alpha)
+        alpha_loss = torch.tensor(0.0)
 
         # Target update
         with torch.no_grad():
             for p, p_t in zip(self.critic.parameters(), self.critic_tgt.parameters()):
                 p_t.data.mul_(1 - self.tau).add_(self.tau * p.data)
 
+        # Compute Q-value estimate for logging (mean Q-value on batch)
+        with torch.no_grad():
+            q_mean = (q1 + q2).mean() / 2.0
+        
         return {
             "critic": critic_loss.item(),
             "actor": actor_loss.item(),
-            "alpha": self.alpha.item(),
-            "alpha_loss": alpha_loss.item()
+            "alpha": self.alpha.item() if isinstance(self.alpha, torch.Tensor) else self.alpha,
+            "alpha_loss": alpha_loss.item() if isinstance(alpha_loss, torch.Tensor) else 0.0,
+            "q_value": q_mean.item()
         }
 
 # -----------------------------
 # Unity env helpers
 # -----------------------------
 def connect_unity(worker_id=None, base_port=None):
-    from mlagents_envs.exception import UnityWorkerInUseException
-    
     if worker_id is None:
         worker_id = cfg.worker_id
     if base_port is None:
@@ -367,7 +372,11 @@ def collect_step(env, behavior, spec, agent: SACAgent, replay: Replay, determini
 # -----------------------------
 # Training loop
 # -----------------------------
-def train():
+def train(run_id=None):
+    # Override output directory if run_id is provided
+    if run_id is not None:
+        cfg.out_dir = f"./results/{run_id}"
+    
     os.makedirs(cfg.out_dir, exist_ok=True)
     env, behavior, spec, obs_dim, act_dim, discrete_size = connect_unity()
     print(f"[Unity] behavior={behavior} obs_dim={obs_dim} act_dim={act_dim} discrete_size={discrete_size}")
@@ -375,9 +384,20 @@ def train():
     agent = SACAgent(obs_dim, act_dim, cfg)
     replay = Replay(obs_dim, act_dim, cfg.replay_size, agent.device)
 
+    # TensorBoard logging
+    writer = SummaryWriter(log_dir=cfg.out_dir)
+    print(f"[TensorBoard] Logging to {cfg.out_dir}")
+
     env_steps = 0
     last_save = 0
     stats = deque(maxlen=100)
+    
+    # Episode tracking for logging (compatible with ML-Agents format)
+    episode_rewards = {}  # agent_id -> cumulative reward
+    episode_lengths = {}  # agent_id -> episode length
+    episode_count = 0
+    episode_reward_history = deque(maxlen=100)
+    episode_length_history = deque(maxlen=100)
 
     # Initial random exploration
     while env_steps < cfg.init_random_steps:
@@ -403,6 +423,10 @@ def train():
         next_obs = np.zeros_like(obs, dtype=np.float32)
 
         for i, aid in enumerate(dec.agent_id):
+            if aid not in episode_rewards:
+                episode_rewards[aid] = 0.0
+                episode_lengths[aid] = 0
+            
             if aid in term:
                 rewards[i] = term[aid].reward
                 dones[i] = 1.0
@@ -410,6 +434,29 @@ def train():
             else:
                 rewards[i] = dec2[aid].reward
                 next_obs[i] = dec2[aid].obs[0]
+            
+            episode_rewards[aid] += rewards[i]
+            episode_lengths[aid] += 1
+            
+            # Log episode completion (reduced frequency to reduce overhead)
+            if dones[i]:
+                episode_reward_history.append(episode_rewards[aid])
+                episode_length_history.append(episode_lengths[aid])
+                episode_count += 1
+                
+                # Only log every 10th episode to reduce overhead
+                if episode_count % 10 == 0:
+                    writer.add_scalar('Environment/Cumulative Reward', episode_rewards[aid], episode_count)
+                    writer.add_scalar('Environment/Episode Length', episode_lengths[aid], episode_count)
+                    if len(episode_reward_history) >= 10:
+                        writer.add_scalar('Environment/Mean Cumulative Reward', 
+                                        np.mean(episode_reward_history), episode_count)
+                        writer.add_scalar('Environment/Mean Episode Length', 
+                                        np.mean(episode_length_history), episode_count)
+                
+                # Delete keys to prevent memory leak (don't just zero them)
+                del episode_rewards[aid]
+                del episode_lengths[aid]
 
         for i in range(len(rewards)):
             replay.add(obs[i], a[i], rewards[i], next_obs[i], dones[i])
@@ -417,20 +464,115 @@ def train():
 
     # Main loop
     while env_steps < cfg.total_env_steps:
-        env_steps += collect_step(env, behavior, spec, agent, replay)
+        dec, term = env.get_steps(behavior)
+        
+        # Handle case when no agents need decisions (prevent tight loop)
+        if len(dec) == 0:
+            # If we have terminal agents, step to get new decision agents
+            if len(term) > 0:
+                env.step()
+            # Don't sleep here - let Unity run naturally, just continue the loop
+            continue
+        
+        # Process agents (we know len(dec) > 0 here)
+        obs = dec.obs[0]
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=agent.device)
+        with torch.no_grad():
+            a_t = agent.act(obs_t, deterministic=False)
+        a = a_t.cpu().numpy().astype(np.float32)
+        a = np.clip(a, -1.0, 1.0)
+        
+        if a.ndim == 1:
+            a = a.reshape(1, -1)
+
+        dec2, term = unity_step(env, behavior, a, spec=spec)
+
+        rewards = np.zeros(len(dec), dtype=np.float32)
+        dones = np.zeros(len(dec), dtype=np.float32)
+        next_obs = np.zeros_like(obs, dtype=np.float32)
+
+        for i, aid in enumerate(dec.agent_id):
+            if aid not in episode_rewards:
+                episode_rewards[aid] = 0.0
+                episode_lengths[aid] = 0
+            
+            if aid in term:
+                rewards[i] = term[aid].reward
+                dones[i] = 1.0
+                next_obs[i] = term[aid].obs[0]
+            else:
+                rewards[i] = dec2[aid].reward
+                next_obs[i] = dec2[aid].obs[0]
+            
+            episode_rewards[aid] += rewards[i]
+            episode_lengths[aid] += 1
+            
+            # Log episode completion (reduced frequency to reduce overhead)
+            if dones[i]:
+                episode_reward_history.append(episode_rewards[aid])
+                episode_length_history.append(episode_lengths[aid])
+                episode_count += 1
+                
+                # Only log every 10th episode to reduce overhead
+                if episode_count % 10 == 0:
+                    writer.add_scalar('Environment/Cumulative Reward', episode_rewards[aid], episode_count)
+                    writer.add_scalar('Environment/Episode Length', episode_lengths[aid], episode_count)
+                    if len(episode_reward_history) >= 10:
+                        writer.add_scalar('Environment/Mean Cumulative Reward', 
+                                        np.mean(episode_reward_history), episode_count)
+                        writer.add_scalar('Environment/Mean Episode Length', 
+                                        np.mean(episode_length_history), episode_count)
+                
+                # Delete keys to prevent memory leak (don't just zero them)
+                del episode_rewards[aid]
+                del episode_lengths[aid]
+
+        for i in range(len(rewards)):
+            replay.add(obs[i], a[i], rewards[i], next_obs[i], dones[i])
+        env_steps += len(rewards)
 
         if env_steps >= cfg.update_after and env_steps % cfg.update_every == 0:
             for _ in range(cfg.gradient_steps):
                 metrics = agent.update(replay)
+            
             stats.append(metrics["critic"])
-            if len(stats) == stats.maxlen:
-                print(f"Steps {env_steps:>8} | Qloss {sum(stats)/len(stats):.4f} | alpha {metrics['alpha']:.3f}")
+            
+            # Log training metrics (compatible with ML-Agents format)
+            if env_steps % cfg.summary_freq == 0:
+                writer.add_scalar('Policy/Critic Loss', metrics["critic"], env_steps)
+                writer.add_scalar('Policy/Actor Loss', metrics["actor"], env_steps)
+                writer.add_scalar('Policy/Alpha', metrics["alpha"], env_steps)
+                writer.add_scalar('Policy/Alpha Loss', metrics["alpha_loss"], env_steps)
+                writer.add_scalar('Policy/Value Estimate', metrics["q_value"], env_steps)
+                writer.add_scalar('Policy/Learning Rate', cfg.lr, env_steps)
+                # Log entropy (negative log prob mean, similar to PPO's entropy)
+                # We can approximate this from the actor's log prob distribution
+                # Reduced batch size to prevent blocking Unity communication
+                with torch.no_grad():
+                    entropy_batch_size = min(200, replay.count)  # Reduced from 1000 to 200
+                    if entropy_batch_size > 0:
+                        o_sample, _, _, _, _ = replay.sample(entropy_batch_size)
+                        _, logp_sample = agent.actor.sample(o_sample)
+                        entropy_estimate = -logp_sample.mean().item()
+                        writer.add_scalar('Policy/Entropy', entropy_estimate, env_steps)
+                # Let TensorBoard handle flushing itself (removed explicit flush to reduce I/O overhead)
+            
+            # Print progress every 10k steps
+            if env_steps % 10_000 == 0:
+                avg_qloss = sum(stats)/len(stats) if len(stats) > 0 else metrics["critic"]
+                print(f"Steps {env_steps:>8} | Qloss {avg_qloss:.4f} | alpha {metrics['alpha']:.3f}")
 
         if env_steps - last_save >= cfg.save_every:
+            # Save alpha value (handle both constant and auto-tuned cases)
+            if agent.log_alpha is not None:
+                alpha_value = agent.log_alpha.detach().cpu()
+            else:
+                alpha_value = agent.alpha.detach().cpu() if isinstance(agent.alpha, torch.Tensor) else agent.alpha
+            
             torch.save({
                 "actor": agent.actor.state_dict(),
                 "critic": agent.critic.state_dict(),
-                "alpha": agent.log_alpha.detach().cpu(),
+                "alpha": alpha_value,
                 "cfg": cfg.__dict__,
                 "obs_dim": obs_dim,
                 "act_dim": act_dim
@@ -438,9 +580,16 @@ def train():
             last_save = env_steps
             print(f"Saved checkpoint at {env_steps} steps.")
 
+    writer.close()
     env.close()
     torch.save(agent.actor.state_dict(), os.path.join(cfg.out_dir, "sac_actor_final.pt"))
     print("Training complete.")
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description='Train SAC agent on Unity ML-Agents environment')
+    parser.add_argument('--run-id', type=str, default=None,
+                       help='Run identifier for output directory (e.g., sac_course_v1). Default: sac_course')
+    
+    args = parser.parse_args()
+    
+    train(run_id=args.run_id)
