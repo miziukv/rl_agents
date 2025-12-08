@@ -1,6 +1,6 @@
 # RL Agents - Unity ML-Agents
 
-A minimal Unity + ML-Agents project for training a navigation agent to reach a goal in a simple challenge course
+A minimal Unity + ML-Agents project for training a navigation agent to reach a goal in a simple challenge course. Includes both PPO (via ML-Agents) and a custom SAC implementation for comparison.
 
 ## What's Included
 
@@ -14,6 +14,10 @@ A minimal Unity + ML-Agents project for training a navigation agent to reach a g
 
 **Training configs** (`config/`):
 - `challenge_ppo.yaml` – PPO trainer settings
+
+**Python training scripts**:
+- `sac.py` – custom Soft Actor-Critic implementation
+- `compare_results.py` – compare training results between PPO and SAC
 
 ## Requirements
 
@@ -73,7 +77,9 @@ _(Already set up in repo, but for reference)_
 
 _Do this once per machine._
 
-### Windows (PowerShell or Git Bash)
+### Install Dependencies
+
+**Windows (PowerShell or Git Bash):**
 
 ```bash
 python -m venv .venv
@@ -85,17 +91,23 @@ python -m venv .venv
 source .venv/Scripts/activate
 
 python -m pip install --upgrade pip
-pip install mlagents torch tensorboard
+pip install -r requirements.txt
 ```
 
-### macOS / Linux
+**macOS / Linux:**
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install mlagents torch tensorboard
+pip install -r requirements.txt
 ```
+
+The `requirements.txt` includes:
+- `mlagents` and `mlagents-envs` for PPO training
+- `torch` for SAC training
+- `tensorboard` for visualization
+- Other dependencies
 
 ---
 
@@ -180,29 +192,37 @@ Look for mean reward trending upward and more frequent goal hits.
 
 ---
 
-## 4b) SAC Training (Custom Implementation)
+## 5) SAC Training (Custom Implementation)
 
-A custom Soft Actor-Critic (SAC) implementation is provided in `train_sac.py` for comparison with PPO.
+A custom Soft Actor-Critic (SAC) implementation is provided in `sac.py` for comparison with PPO.
 
 ### Start SAC Training
 
 From repo root:
 
 ```bash
-python train_sac.py --run-id=sac_course_v1
+python sac.py --run-id=sac_course_v1
 ```
+
+The `--run-id` parameter sets the output directory (default: `sac_course`). Results will be saved to `results/<run-id>/`.
 
 ### SAC Hyperparameters
 
-Default hyperparameters (can be overridden via command line):
-- `--batch-size`: 256
-- `--buffer-size`: 1000000
-- `--learning-starts`: 10000 (random exploration before learning)
-- `--gamma`: 0.995
-- `--tau`: 0.005 (soft update coefficient)
-- `--alpha`: 0.2 (entropy coefficient, auto-tuned)
-- `--lr`: 3e-4
-- `--hidden-dim`: 256
+Hyperparameters are defined in the `SACCfg` dataclass in `sac.py`. Default values:
+
+- `total_env_steps`: 500,000
+- `init_random_steps`: 10,000 (random exploration before learning)
+- `update_after`: 10,000 (start updates after this many steps)
+- `update_every`: 10 (update every N steps)
+- `batch_size`: 128
+- `gamma`: 0.995
+- `tau`: 0.005 (soft target update coefficient)
+- `lr`: 3e-4
+- `hidden`: 256 (hidden units)
+- `replay_size`: 1,000,000
+- `alpha`: 0.2 (entropy coefficient, constant)
+
+To modify hyperparameters, edit the `SACCfg` class in `sac.py`.
 
 ### Connect Unity
 
@@ -218,20 +238,41 @@ Default hyperparameters (can be overridden via command line):
 tensorboard --logdir results
 ```
 
-Compare SAC vs PPO:
-- SAC typically learns faster (sample efficient) but may be less stable
-- PPO is more stable but requires more samples
-- Check `episode/mean_reward` in TensorBoard for comparison
-
-### Resume Training
-
-```bash
-python train_sac.py --run-id=sac_course_v1 --resume
-```
+SAC logs metrics compatible with ML-Agents format:
+- `Environment/Cumulative Reward` – per-episode rewards
+- `Environment/Mean Cumulative Reward` – smoothed mean rewards
+- `Environment/Episode Length` – episode lengths
+- `Policy/Critic Loss` – Q-function loss
+- `Policy/Actor Loss` – policy loss
+- `Policy/Entropy` – policy entropy
 
 ---
 
-## 5) Use the Trained Policy in the Editor
+## 6) Compare Training Results
+
+Use `compare_results.py` to compare PPO and SAC training runs:
+
+```bash
+python compare_results.py --ppo-dir results/ppo_course_v1 --sac-dir results/sac_course_v1 --output comparison.png
+```
+
+This generates a comparison plot with:
+- Raw and smoothed reward curves
+- Episode lengths
+- Policy/value losses
+- Entropy
+- Final performance comparison
+- Summary statistics
+
+Default directories can be set via command-line arguments:
+- `--ppo-dir`: PPO TensorBoard log directory (default: `results/ppo_course_v1`)
+- `--sac-dir`: SAC TensorBoard log directory (default: `results/sac_course`)
+- `--output`: Output filename (default: `comparison.png`)
+- `--smooth`: Smoothing window size (default: 100)
+
+---
+
+## 7) Use the Trained Policy in the Editor
 
 1. Find the exported `.onnx` model in `results/<run-id>/` (or export via ML-Agents menu).
 2. Copy it into `Assets/Models/` (create the folder if needed).
@@ -242,7 +283,7 @@ python train_sac.py --run-id=sac_course_v1 --resume
 
 ---
 
-## 6) Project / Repo Tips
+## 8) Project / Repo Tips
 
 ### Recommended Unity Settings for Faster Training
 
@@ -253,14 +294,22 @@ python train_sac.py --run-id=sac_course_v1 --resume
 
 ---
 
-## 7) Troubleshooting
+## 9) Troubleshooting
 
 ### Trainer says "The Unity environment took too long to respond"
 
 - Keep Play mode running (don't pause/stop).
 - Behavior Type must be `Default` while training.
 - Avoid saving scripts during Play (will trigger recompile pauses). If needed, set Script Changes While Playing as above.
-- Reconnect by re-pressing Play, or restart `mlagents-learn`.
+- Reconnect by re-pressing Play, or restart the trainer.
+
+### Port already in use (SAC training)
+
+If you see "Port 5004 is already in use":
+- Close any other Python scripts using ML-Agents
+- Kill the process using port 5004:
+  - Windows: `netstat -ano | findstr :5004` then `taskkill /PID <PID> /F`
+  - Linux/macOS: `lsof -ti:5004 | xargs kill`
 
 ### "More/Fewer observations than vector observation size" warnings
 

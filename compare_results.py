@@ -1,31 +1,15 @@
-"""
-Compare training results between SAC and PPO implementations.
-Loads TensorBoard logs and creates comparison visualizations.
-"""
+"""Compare training results between SAC and PPO implementations."""
 
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
 import os
-from pathlib import Path
-
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 
-def load_tensorboard_scalars(logdir, tag, default_value=None):
-    """Load scalar values from TensorBoard log directory.
-    
-    Args:
-        logdir: Path to TensorBoard log directory
-        tag: Tag name to load (e.g., 'Environment/Cumulative Reward')
-        default_value: Value to return if tag not found
-    
-    Returns:
-        steps: numpy array of step values
-        values: numpy array of scalar values
-    """
+def load_scalar(logdir, tag, default=None):
+    """Load scalar values from TensorBoard log directory."""
     if not os.path.exists(logdir):
-        print(f"Warning: Directory {logdir} does not exist")
         return None, None
     
     try:
@@ -33,119 +17,90 @@ def load_tensorboard_scalars(logdir, tag, default_value=None):
         ea.Reload()
         
         if tag not in ea.Tags()['scalars']:
-            if default_value is not None:
-                print(f"Warning: Tag '{tag}' not found in {logdir}, using default value")
-                return np.array([0]), np.array([default_value])
-            print(f"Warning: Tag '{tag}' not found in {logdir}")
+            if default is not None:
+                return np.array([0]), np.array([default])
             return None, None
         
-        scalar_events = ea.Scalars(tag)
-        steps = np.array([s.step for s in scalar_events])
-        values = np.array([s.value for s in scalar_events])
-        
-        return steps, values
+        events = ea.Scalars(tag)
+        return np.array([s.step for s in events]), np.array([s.value for s in events])
     except Exception as e:
         print(f"Error loading {logdir}: {e}")
         return None, None
 
 
-def smooth_curve(values, window_size=100):
-    """Apply moving average smoothing to a curve."""
-    if len(values) < window_size:
+def smooth(values, window=100):
+    """Apply moving average smoothing."""
+    if len(values) < window:
         return values
-    smoothed = np.convolve(values, np.ones(window_size)/window_size, mode='valid')
-    # Pad beginning to match original length
-    padded = np.concatenate([values[:window_size-1], smoothed])
-    return padded
+    smoothed = np.convolve(values, np.ones(window)/window, mode='valid')
+    return np.concatenate([values[:window-1], smoothed])
 
 
 def find_mlagents_logdir(base_dir):
-    """Find ML-Agents TensorBoard log directory.
-    ML-Agents stores logs in a behavior subdirectory (e.g., CourseAgent/).
-    """
+    """Find ML-Agents TensorBoard log directory (may be in behavior subdirectory)."""
     if not os.path.exists(base_dir):
         return base_dir
     
-    # Check if there's a behavior subdirectory
     for item in os.listdir(base_dir):
         item_path = os.path.join(base_dir, item)
         if os.path.isdir(item_path):
-            # Check if this directory contains TensorBoard event files
             try:
-                for file in os.listdir(item_path):
-                    if file.startswith('events.out.tfevents'):
-                        return item_path
+                if any(f.startswith('events.out.tfevents') for f in os.listdir(item_path)):
+                    return item_path
             except (OSError, PermissionError):
                 continue
     
-    # If no subdirectory found, return base directory
     return base_dir
 
 
-def list_available_tags(logdir):
-    """List all available TensorBoard tags in a log directory."""
-    try:
-        ea = EventAccumulator(logdir)
-        ea.Reload()
-        if 'scalars' in ea.Tags():
-            return ea.Tags()['scalars']
-        return []
-    except Exception as e:
-        print(f"Error listing tags in {logdir}: {e}")
-        return []
-
-
-def try_load_tag(logdir, tag_variants):
-    """Try to load a tag using multiple possible names.
-    
-    Args:
-        logdir: Path to TensorBoard log directory
-        tag_variants: List of tag names to try
-    
-    Returns:
-        steps, values: numpy arrays or (None, None) if not found
-    """
-    for tag in tag_variants:
-        steps, values = load_tensorboard_scalars(logdir, tag)
+def try_load(logdir, tags):
+    """Try loading a tag using multiple possible names."""
+    for tag in tags:
+        steps, values = load_scalar(logdir, tag)
         if values is not None:
             return steps, values
     return None, None
 
 
+def plot_metric(ax, ppo_data, sac_data, xlabel, ylabel, title, log_scale=False, smooth_window=100):
+    """Helper to plot a metric comparison."""
+    ppo_steps, ppo_values = ppo_data
+    sac_steps, sac_values = sac_data
+    
+    if ppo_values is not None:
+        if smooth_window > 1:
+            ppo_values = smooth(ppo_values, smooth_window)
+        ax.plot(ppo_steps, ppo_values, label='PPO', color='blue', alpha=0.7 if log_scale else 1, linewidth=2)
+    
+    if sac_values is not None:
+        if smooth_window > 1:
+            sac_values = smooth(sac_values, smooth_window)
+        ax.plot(sac_steps, sac_values, label='SAC', color='red', alpha=0.7 if log_scale else 1, linewidth=2)
+    
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    if log_scale:
+        ax.set_yscale('log')
+
+
 def compare_results(ppo_dir, sac_dir, output_file='comparison.png', smooth_window=100):
-    """Compare PPO and SAC training results.
-    
-    Args:
-        ppo_dir: Path to PPO TensorBoard log directory (ML-Agents format)
-        sac_dir: Path to SAC TensorBoard log directory
-        output_file: Output filename for comparison plot
-        smooth_window: Window size for smoothing curves
-    """
-    
-    # Find ML-Agents log directory (may be in behavior subdirectory)
+    """Compare PPO and SAC training results."""
     ppo_logdir = find_mlagents_logdir(ppo_dir)
-    print(f"Loading PPO results from: {ppo_logdir}")
-    print(f"Loading SAC results from: {sac_dir}")
+    print(f"Loading PPO from: {ppo_logdir}")
+    print(f"Loading SAC from: {sac_dir}")
     
-    # Debug: List available tags
-    print("\nAvailable PPO tags:")
-    ppo_tags = list_available_tags(ppo_logdir)
-    for tag in sorted(ppo_tags)[:15]:  # Show first 15
-        print(f"  - {tag}")
-    if len(ppo_tags) > 15:
-        print(f"  ... and {len(ppo_tags) - 15} more")
-    
-    # Load episode rewards - ML-Agents uses 'Environment/Cumulative Reward'
-    ppo_steps, ppo_rewards = try_load_tag(ppo_logdir, [
+    # Load rewards
+    ppo_steps, ppo_rewards = try_load(ppo_logdir, [
         'Environment/Cumulative Reward',
         'CourseAgent/Cumulative Reward',
         'Cumulative Reward'
     ])
     
-    # ML-Agents doesn't have a separate "Mean Reward" tag, so we'll use cumulative reward
-    # and calculate mean ourselves, or use cumulative reward for both
-    ppo_mean_steps, ppo_mean_rewards = try_load_tag(ppo_logdir, [
-        'Environment/Cumulative Reward',  # Use cumulative reward as mean (ML-Agents logs it per episode)
+    ppo_mean_steps, ppo_mean_rewards = try_load(ppo_logdir, [
+        'Environment/Cumulative Reward',
         'CourseAgent/Mean Reward',
         'CourseAgent/Mean Cumulative Reward',
         'Environment/Mean Cumulative Reward',
@@ -153,257 +108,191 @@ def compare_results(ppo_dir, sac_dir, output_file='comparison.png', smooth_windo
         'Mean Cumulative Reward'
     ])
     
-    # If we loaded cumulative reward as mean, we can use it directly
     if ppo_mean_rewards is None and ppo_rewards is not None:
-        ppo_mean_steps = ppo_steps
-        ppo_mean_rewards = ppo_rewards
+        ppo_mean_steps, ppo_mean_rewards = ppo_steps, ppo_rewards
     
-    sac_steps, sac_rewards = load_tensorboard_scalars(sac_dir, 'Environment/Cumulative Reward')
-    sac_mean_steps, sac_mean_rewards = load_tensorboard_scalars(sac_dir, 'Environment/Mean Cumulative Reward')
+    sac_steps, sac_rewards = load_scalar(sac_dir, 'Environment/Cumulative Reward')
+    sac_mean_steps, sac_mean_rewards = load_scalar(sac_dir, 'Environment/Mean Cumulative Reward')
     
-    # Load episode lengths
-    ppo_length_steps, ppo_lengths = try_load_tag(ppo_logdir, [
+    # Load other metrics
+    ppo_length_steps, ppo_lengths = try_load(ppo_logdir, [
         'Environment/Episode Length',
         'CourseAgent/Episode Length',
         'Episode Length'
     ])
-    sac_length_steps, sac_lengths = load_tensorboard_scalars(sac_dir, 'Environment/Episode Length')
+    sac_length_steps, sac_lengths = load_scalar(sac_dir, 'Environment/Episode Length')
     
-    # Load policy metrics - ML-Agents uses 'Losses/Policy Loss' and 'Losses/Value Loss'
-    ppo_policy_loss_steps, ppo_policy_loss = try_load_tag(ppo_logdir, [
+    ppo_policy_steps, ppo_policy_loss = try_load(ppo_logdir, [
         'Losses/Policy Loss',
         'CourseAgent/Policy Loss',
         'Policy/Policy Loss',
         'Policy Loss'
     ])
-    sac_policy_loss_steps, sac_policy_loss = load_tensorboard_scalars(sac_dir, 'Policy/Actor Loss')
+    sac_policy_steps, sac_policy_loss = load_scalar(sac_dir, 'Policy/Actor Loss')
     
-    ppo_value_loss_steps, ppo_value_loss = try_load_tag(ppo_logdir, [
+    ppo_value_steps, ppo_value_loss = try_load(ppo_logdir, [
         'Losses/Value Loss',
         'CourseAgent/Value Loss',
         'Policy/Value Loss',
         'Value Loss'
     ])
-    sac_value_loss_steps, sac_value_loss = load_tensorboard_scalars(sac_dir, 'Policy/Critic Loss')
+    sac_value_steps, sac_value_loss = load_scalar(sac_dir, 'Policy/Critic Loss')
     
-    ppo_entropy_steps, ppo_entropy = try_load_tag(ppo_logdir, [
+    ppo_entropy_steps, ppo_entropy = try_load(ppo_logdir, [
         'Policy/Entropy',
         'CourseAgent/Entropy',
         'Entropy'
     ])
-    sac_entropy_steps, sac_entropy = load_tensorboard_scalars(sac_dir, 'Policy/Entropy')
+    sac_entropy_steps, sac_entropy = load_scalar(sac_dir, 'Policy/Entropy')
     
-    # Create comparison plots
-    fig = plt.figure(figsize=(16, 10))
+    # Create plots
+    plt.figure(figsize=(16, 10))
     
-    # 1. Episode Rewards (Raw)
-    ax1 = plt.subplot(3, 3, 1)
+    # Raw rewards
+    ax = plt.subplot(3, 3, 1)
     if ppo_rewards is not None:
-        plt.plot(ppo_steps, ppo_rewards, alpha=0.2, label='PPO (raw)', color='blue', linewidth=0.5)
+        ax.plot(ppo_steps, ppo_rewards, alpha=0.2, label='PPO', color='blue', linewidth=0.5)
     if sac_rewards is not None:
-        plt.plot(sac_steps, sac_rewards, alpha=0.2, label='SAC (raw)', color='red', linewidth=0.5)
-    plt.xlabel('Episode')
-    plt.ylabel('Episode Reward')
-    plt.title('Episode Rewards (Raw)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+        ax.plot(sac_steps, sac_rewards, alpha=0.2, label='SAC', color='red', linewidth=0.5)
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Reward')
+    ax.set_title('Raw Episode Rewards')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
     
-    # 2. Mean Episode Rewards
-    ax2 = plt.subplot(3, 3, 2)
+    # Mean rewards
+    plot_metric(plt.subplot(3, 3, 2), 
+                (ppo_mean_steps, ppo_mean_rewards),
+                (sac_mean_steps, sac_mean_rewards),
+                'Episode', 'Mean Reward', 'Mean Episode Rewards', smooth_window=smooth_window)
+    
+    # Final performance
+    ax = plt.subplot(3, 3, 3)
+    bars, labels, colors = [], [], []
     if ppo_mean_rewards is not None:
-        ppo_smooth = smooth_curve(ppo_mean_rewards, smooth_window)
-        plt.plot(ppo_mean_steps, ppo_smooth, label='PPO', color='blue', linewidth=2)
+        final_ppo = np.mean(ppo_mean_rewards[-100:]) if len(ppo_mean_rewards) >= 100 else np.mean(ppo_mean_rewards)
+        bars.append(final_ppo)
+        labels.append('PPO')
+        colors.append('blue')
     if sac_mean_rewards is not None:
-        sac_smooth = smooth_curve(sac_mean_rewards, smooth_window)
-        plt.plot(sac_mean_steps, sac_smooth, label='SAC', color='red', linewidth=2)
-    plt.xlabel('Episode')
-    plt.ylabel('Mean Reward (smoothed)')
-    plt.title('Mean Episode Rewards')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+        final_sac = np.mean(sac_mean_rewards[-100:]) if len(sac_mean_rewards) >= 100 else np.mean(sac_mean_rewards)
+        bars.append(final_sac)
+        labels.append('SAC')
+        colors.append('red')
     
-    # 3. Final Performance Comparison
-    ax3 = plt.subplot(3, 3, 3)
-    final_ppo = None
-    final_sac = None
-    if ppo_mean_rewards is not None and len(ppo_mean_rewards) >= 100:
-        final_ppo = np.mean(ppo_mean_rewards[-100:])
-    elif ppo_mean_rewards is not None:
-        final_ppo = np.mean(ppo_mean_rewards)
+    if bars:
+        ax.bar(labels, bars, color=colors, alpha=0.7)
+        ax.set_ylabel('Mean Reward (last 100)')
+        ax.set_title('Final Performance')
+        ax.grid(True, axis='y', alpha=0.3)
     
-    if sac_mean_rewards is not None and len(sac_mean_rewards) >= 100:
-        final_sac = np.mean(sac_mean_rewards[-100:])
-    elif sac_mean_rewards is not None:
-        final_sac = np.mean(sac_mean_rewards)
+    # Episode lengths
+    plot_metric(plt.subplot(3, 3, 4),
+                (ppo_length_steps, ppo_lengths),
+                (sac_length_steps, sac_lengths),
+                'Episode', 'Length', 'Episode Lengths', smooth_window=smooth_window)
     
-    if final_ppo is not None or final_sac is not None:
-        bars = []
-        labels = []
-        colors = []
-        if final_ppo is not None:
-            bars.append(final_ppo)
-            labels.append('PPO')
-            colors.append('blue')
-        if final_sac is not None:
-            bars.append(final_sac)
-            labels.append('SAC')
-            colors.append('red')
-        
-        plt.bar(labels, bars, color=colors, alpha=0.7)
-        plt.ylabel('Mean Reward (last 100 episodes)')
-        plt.title('Final Performance Comparison')
-        plt.grid(True, axis='y', alpha=0.3)
+    # Policy loss
+    plot_metric(plt.subplot(3, 3, 5),
+                (ppo_policy_steps, ppo_policy_loss),
+                (sac_policy_steps, sac_policy_loss),
+                'Steps', 'Policy Loss', 'Policy Loss', log_scale=True)
     
-    # 4. Episode Lengths
-    ax4 = plt.subplot(3, 3, 4)
-    if ppo_lengths is not None:
-        ppo_length_smooth = smooth_curve(ppo_lengths, smooth_window)
-        plt.plot(ppo_length_steps, ppo_length_smooth, label='PPO', color='blue', linewidth=2)
-    if sac_lengths is not None:
-        sac_length_smooth = smooth_curve(sac_lengths, smooth_window)
-        plt.plot(sac_length_steps, sac_length_smooth, label='SAC', color='red', linewidth=2)
-    plt.xlabel('Episode')
-    plt.ylabel('Episode Length')
-    plt.title('Episode Lengths')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    # Value loss
+    plot_metric(plt.subplot(3, 3, 6),
+                (ppo_value_steps, ppo_value_loss),
+                (sac_value_steps, sac_value_loss),
+                'Steps', 'Value Loss', 'Value Loss', log_scale=True)
     
-    # 5. Policy Loss
-    ax5 = plt.subplot(3, 3, 5)
-    if ppo_policy_loss is not None:
-        plt.plot(ppo_policy_loss_steps, ppo_policy_loss, label='PPO', color='blue', alpha=0.7)
-    if sac_policy_loss is not None:
-        plt.plot(sac_policy_loss_steps, sac_policy_loss, label='SAC', color='red', alpha=0.7)
-    plt.xlabel('Environment Steps')
-    plt.ylabel('Policy Loss')
-    plt.title('Policy Loss')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.yscale('log')
+    # Entropy
+    plot_metric(plt.subplot(3, 3, 7),
+                (ppo_entropy_steps, ppo_entropy),
+                (sac_entropy_steps, sac_entropy),
+                'Steps', 'Entropy', 'Policy Entropy')
     
-    # 6. Value Loss
-    ax6 = plt.subplot(3, 3, 6)
-    if ppo_value_loss is not None:
-        plt.plot(ppo_value_loss_steps, ppo_value_loss, label='PPO', color='blue', alpha=0.7)
-    if sac_value_loss is not None:
-        plt.plot(sac_value_loss_steps, sac_value_loss, label='SAC', color='red', alpha=0.7)
-    plt.xlabel('Environment Steps')
-    plt.ylabel('Value Loss')
-    plt.title('Value Loss')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.yscale('log')
+    # Learning curves (duplicate of mean rewards but kept for consistency)
+    plot_metric(plt.subplot(3, 3, 8),
+                (ppo_mean_steps, ppo_mean_rewards),
+                (sac_mean_steps, sac_mean_rewards),
+                'Episode', 'Mean Reward', 'Learning Curves', smooth_window=smooth_window)
     
-    # 7. Entropy
-    ax7 = plt.subplot(3, 3, 7)
-    if ppo_entropy is not None:
-        plt.plot(ppo_entropy_steps, ppo_entropy, label='PPO', color='blue', alpha=0.7)
-    if sac_entropy is not None:
-        plt.plot(sac_entropy_steps, sac_entropy, label='SAC', color='red', alpha=0.7)
-    plt.xlabel('Environment Steps')
-    plt.ylabel('Entropy')
-    plt.title('Policy Entropy')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    # Stats table
+    ax = plt.subplot(3, 3, 9)
+    ax.axis('off')
     
-    # 8. Sample Efficiency (Reward vs Steps)
-    ax8 = plt.subplot(3, 3, 8)
-    if ppo_mean_rewards is not None and ppo_mean_steps is not None:
-        # Convert episode count to approximate steps (if needed)
-        # For now, use episode as x-axis
-        ppo_smooth = smooth_curve(ppo_mean_rewards, smooth_window)
-        plt.plot(ppo_mean_steps, ppo_smooth, label='PPO', color='blue', linewidth=2)
-    if sac_mean_rewards is not None and sac_mean_steps is not None:
-        sac_smooth = smooth_curve(sac_mean_rewards, smooth_window)
-        plt.plot(sac_mean_steps, sac_smooth, label='SAC', color='red', linewidth=2)
-    plt.xlabel('Episode')
-    plt.ylabel('Mean Reward')
-    plt.title('Learning Curves')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    # 9. Summary Statistics Table
-    ax9 = plt.subplot(3, 3, 9)
-    ax9.axis('off')
-    
-    stats_text = "Summary Statistics\n" + "="*30 + "\n\n"
+    stats = ["Summary Statistics", "="*30, ""]
     
     if ppo_mean_rewards is not None:
-        stats_text += "PPO:\n"
-        stats_text += f"  Episodes: {len(ppo_mean_rewards)}\n"
+        stats.extend(["PPO:", f"  Episodes: {len(ppo_mean_rewards)}"])
         if len(ppo_mean_rewards) > 0:
-            stats_text += f"  Final Mean: {ppo_mean_rewards[-1]:.2f}\n"
+            stats.append(f"  Final: {ppo_mean_rewards[-1]:.2f}")
             if len(ppo_mean_rewards) >= 100:
-                stats_text += f"  Last 100 Mean: {np.mean(ppo_mean_rewards[-100:]):.2f}\n"
-            stats_text += f"  Max: {np.max(ppo_mean_rewards):.2f}\n"
-        stats_text += "\n"
+                stats.append(f"  Last 100: {np.mean(ppo_mean_rewards[-100:]):.2f}")
+            stats.append(f"  Max: {np.max(ppo_mean_rewards):.2f}")
+        stats.append("")
     
     if sac_mean_rewards is not None:
-        stats_text += "SAC:\n"
-        stats_text += f"  Episodes: {len(sac_mean_rewards)}\n"
+        stats.extend(["SAC:", f"  Episodes: {len(sac_mean_rewards)}"])
         if len(sac_mean_rewards) > 0:
-            stats_text += f"  Final Mean: {sac_mean_rewards[-1]:.2f}\n"
+            stats.append(f"  Final: {sac_mean_rewards[-1]:.2f}")
             if len(sac_mean_rewards) >= 100:
-                stats_text += f"  Last 100 Mean: {np.mean(sac_mean_rewards[-100:]):.2f}\n"
-            stats_text += f"  Max: {np.max(sac_mean_rewards):.2f}\n"
+                stats.append(f"  Last 100: {np.mean(sac_mean_rewards[-100:]):.2f}")
+            stats.append(f"  Max: {np.max(sac_mean_rewards):.2f}")
     
-    ax9.text(0.1, 0.9, stats_text, transform=ax9.transAxes, 
-             fontsize=10, verticalalignment='top', family='monospace')
+    ax.text(0.1, 0.9, '\n'.join(stats), transform=ax.transAxes,
+            fontsize=10, verticalalignment='top', family='monospace')
     
     plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    print(f"\nComparison plot saved to: {output_file}")
+    print(f"\nSaved to: {output_file}")
     
-    # Print summary to console
+    # Print summary
     print("\n" + "="*60)
-    print("SUMMARY STATISTICS")
+    print("SUMMARY")
     print("="*60)
     
     if ppo_mean_rewards is not None:
         print("\nPPO:")
-        print(f"  Total Episodes: {len(ppo_mean_rewards)}")
+        print(f"  Episodes: {len(ppo_mean_rewards)}")
         if len(ppo_mean_rewards) > 0:
-            print(f"  Final Mean Reward: {ppo_mean_rewards[-1]:.2f}")
+            print(f"  Final: {ppo_mean_rewards[-1]:.2f}")
             if len(ppo_mean_rewards) >= 100:
-                print(f"  Last 100 Episodes Mean: {np.mean(ppo_mean_rewards[-100:]):.2f} ± {np.std(ppo_mean_rewards[-100:]):.2f}")
-            print(f"  Maximum Mean Reward: {np.max(ppo_mean_rewards):.2f}")
+                mean = np.mean(ppo_mean_rewards[-100:])
+                std = np.std(ppo_mean_rewards[-100:])
+                print(f"  Last 100: {mean:.2f} ± {std:.2f}")
+            print(f"  Max: {np.max(ppo_mean_rewards):.2f}")
     
     if sac_mean_rewards is not None:
         print("\nSAC:")
-        print(f"  Total Episodes: {len(sac_mean_rewards)}")
+        print(f"  Episodes: {len(sac_mean_rewards)}")
         if len(sac_mean_rewards) > 0:
-            print(f"  Final Mean Reward: {sac_mean_rewards[-1]:.2f}")
+            print(f"  Final: {sac_mean_rewards[-1]:.2f}")
             if len(sac_mean_rewards) >= 100:
-                print(f"  Last 100 Episodes Mean: {np.mean(sac_mean_rewards[-100:]):.2f} ± {np.std(sac_mean_rewards[-100:]):.2f}")
-            print(f"  Maximum Mean Reward: {np.max(sac_mean_rewards):.2f}")
+                mean = np.mean(sac_mean_rewards[-100:])
+                std = np.std(sac_mean_rewards[-100:])
+                print(f"  Last 100: {mean:.2f} ± {std:.2f}")
+            print(f"  Max: {np.max(sac_mean_rewards):.2f}")
     
     if ppo_mean_rewards is not None and sac_mean_rewards is not None:
-        print("\nComparison:")
         ppo_final = np.mean(ppo_mean_rewards[-100:]) if len(ppo_mean_rewards) >= 100 else np.mean(ppo_mean_rewards)
         sac_final = np.mean(sac_mean_rewards[-100:]) if len(sac_mean_rewards) >= 100 else np.mean(sac_mean_rewards)
         diff = sac_final - ppo_final
-        pct_diff = (diff / abs(ppo_final)) * 100 if ppo_final != 0 else 0
-        print(f"  SAC vs PPO: {diff:+.2f} ({pct_diff:+.1f}%)")
+        pct = (diff / abs(ppo_final)) * 100 if ppo_final != 0 else 0
+        print(f"\nComparison: SAC vs PPO = {diff:+.2f} ({pct:+.1f}%)")
     
     print("="*60)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Compare SAC and PPO training results')
-    parser.add_argument('--ppo-dir', type=str, 
-                       default='results/ppo_course_v1',
-                       help='Path to PPO TensorBoard log directory')
-    parser.add_argument('--sac-dir', type=str,
-                       default='results/sac_course',
-                       help='Path to SAC TensorBoard log directory')
-    parser.add_argument('--output', type=str,
-                       default='comparison.png',
-                       help='Output filename for comparison plot')
-    parser.add_argument('--smooth', type=int,
-                       default=100,
-                       help='Smoothing window size for curves')
+    parser.add_argument('--ppo-dir', type=str, default='results/ppo_course_v1',
+                       help='PPO TensorBoard log directory')
+    parser.add_argument('--sac-dir', type=str, default='results/sac_course',
+                       help='SAC TensorBoard log directory')
+    parser.add_argument('--output', type=str, default='comparison.png',
+                       help='Output filename')
+    parser.add_argument('--smooth', type=int, default=100,
+                       help='Smoothing window size')
     
     args = parser.parse_args()
-    
     compare_results(args.ppo_dir, args.sac_dir, args.output, args.smooth)
-
